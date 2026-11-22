@@ -1,5 +1,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClient.h>
 #include <SoftwareSerial.h>
 #include "secrets.h"
 
@@ -7,6 +9,15 @@ SoftwareSerial unoSerial(D5, D6);
 ESP8266WebServer server(80);
 
 String dataJsonTerakhir = "{\"id\":\"smartirrigate-01\",\"tanah\":0,\"suhu\":0,\"udara\":0,\"cahaya\":0,\"pompa\":0,\"mode\":0,\"error\":0}";
+
+// Variabel penyimpanan nilai terbaru untuk dikirim ke ThingSpeak
+int valTanah = 0, valCahaya = 0, valPompa = 0, valError = 0;
+float valSuhu = 0.0, valUdara = 0.0;
+bool dataBaruMasuk = false;
+
+unsigned long lastThingSpeak = 0;
+const unsigned long intervalTS = 20000; // Kirim ke ThingSpeak tiap 20 detik
+String statusCloud = "Menunggu pengiriman...";
 
 const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -19,12 +30,13 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
     * { box-sizing: border-box; font-family: 'Segoe UI', sans-serif; margin: 0; padding: 0; }
     body { background: #0f172a; color: #f8fafc; padding: 14px; display: flex; justify-content: center; }
     .container { width: 100%; max-width: 440px; }
-    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
     h2 { color: #38bdf8; font-size: 1.25rem; }
     .badge { padding: 4px 10px; border-radius: 99px; font-size: 0.75rem; font-weight: bold; }
     .online { background: #14532d; color: #4ade80; border: 1px solid #22c55e; }
     .offline { background: #7f1d1d; color: #fca5a5; border: 1px solid #ef4444; }
-    .meta { font-size: 0.75rem; color: #94a3b8; margin-bottom: 12px; display: flex; justify-content: space-between; }
+    .meta { font-size: 0.75rem; color: #94a3b8; margin-bottom: 10px; display: flex; justify-content: space-between; }
+    .cloud-bar { font-size: 0.75rem; background: #1e293b; color: #a5b4fc; padding: 7px 10px; border-radius: 8px; border: 1px solid #334155; margin-bottom: 12px; text-align: center; }
     .status-banner { padding: 11px; border-radius: 10px; text-align: center; font-weight: bold; margin-bottom: 14px; background: #1e293b; border: 1px solid #334155; font-size: 0.9rem; }
     .err { background: #7f1d1d !important; border-color: #ef4444 !important; color: #fecaca; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
@@ -53,6 +65,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
       <span>ID: smartirrigate-01</span>
       <span id="lastTime">Update: --:--:--</span>
     </div>
+    <div id="cloudStatus" class="cloud-bar">ThingSpeak Cloud: Menunggu sinkronisasi...</div>
 
     <div id="banner" class="status-banner">Status: Memuat data...</div>
 
@@ -120,6 +133,7 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
 
           const now = new Date();
           document.getElementById('lastTime').innerText = 'Update: ' + now.toLocaleTimeString('id-ID');
+          document.getElementById('cloudStatus').innerText = 'ThingSpeak Cloud: ' + d.cloud;
 
           document.getElementById('tanah').innerText  = d.tanah + ' %';
           document.getElementById('suhu').innerText   = d.suhu + ' °C';
@@ -164,6 +178,45 @@ const char HTML_DASHBOARD[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+float ambilNilaiJson(String json, String key) {
+  int idx = json.indexOf("\"" + key + "\":");
+  if (idx == -1) return 0;
+  int start = idx + key.length() + 3;
+  int end = json.indexOf(",", start);
+  if (end == -1) end = json.indexOf("}", start);
+  return json.substring(start, end).toFloat();
+}
+
+void kirimKeThingSpeak() {
+  if (WiFi.status() != WL_CONNECTED) {
+    statusCloud = "Terputus (Wi-Fi Offline)";
+    return;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://api.thingspeak.com/update?api_key=" + String(TS_API_KEY) +
+               "&field1=" + String(valTanah) +
+               "&field2=" + String(valSuhu, 1) +
+               "&field3=" + String(valUdara, 1) +
+               "&field4=" + String(valCahaya) +
+               "&field5=" + String(valPompa);
+
+  http.begin(client, url);
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String payload = http.getString();
+    if (payload.toInt() > 0) {
+      statusCloud = "Terkirim (Entry #" + payload + ")";
+    } else {
+      statusCloud = "Menunggu interval 15d...";
+    }
+  } else {
+    statusCloud = "Gagal kirim (Internet Mati)";
+  }
+  http.end();
+}
+
 void setup() {
   Serial.begin(9600);
   unoSerial.begin(9600);
@@ -178,7 +231,12 @@ void setup() {
   Serial.println(WiFi.localIP());
 
   server.on("/", []() { server.send_P(200, "text/html", HTML_DASHBOARD); });
-  server.on("/data", []() { server.send(200, "application/json", dataJsonTerakhir); });
+  server.on("/data", []() {
+    String res = dataJsonTerakhir;
+    res.remove(res.length() - 1);
+    res += ",\"cloud\":\"" + statusCloud + "\"}";
+    server.send(200, "application/json", res);
+  });
   server.on("/pompa", []() {
     if (server.hasArg("state")) {
       String state = server.arg("state");
@@ -198,7 +256,19 @@ void loop() {
     masuk.trim();
     if (masuk.startsWith("{") && masuk.endsWith("}")) {
       dataJsonTerakhir = masuk;
+      valTanah  = (int)ambilNilaiJson(masuk, "tanah");
+      valSuhu   = ambilNilaiJson(masuk, "suhu");
+      valUdara  = ambilNilaiJson(masuk, "udara");
+      valCahaya = (int)ambilNilaiJson(masuk, "cahaya");
+      valPompa  = (int)ambilNilaiJson(masuk, "pompa");
+      dataBaruMasuk = true;
     }
   }
+
+  if (dataBaruMasuk && (millis() - lastThingSpeak >= intervalTS)) {
+    lastThingSpeak = millis();
+    kirimKeThingSpeak();
+  }
+
   server.handleClient();
 }
